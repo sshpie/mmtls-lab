@@ -1,6 +1,8 @@
 # mmtls-lab
 
-Custom ARM64 tooling for WeChat MMTLS research — Tencent's TLS 1.3-variant protocol used by WeChat 8.x. Every component built from scratch. No Frida, no commodity injection frameworks, no pre-built tools. Pure ptrace.
+Custom ARM64 tooling for WeChat MMTLS research.
+Tencent's TLS 1.3-variant protocol used by WeChat 8.x. 
+Every component built from scratch.
 
 ## Architecture
 
