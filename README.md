@@ -2,7 +2,6 @@
 
 Custom ARM64 tooling for WeChat MMTLS research.
 Tencent's TLS 1.3-variant protocol used by WeChat 8.x. 
-Every component built from scratch.
 
 ## Architecture
 
