@@ -22,7 +22,12 @@ mmtls-lab/
 ├── evasion/
 │   └── mmtls_hide.c       # Detection evasion shim
 └── emulator/
-    └── setup.sh           # AVD creation, WeChat APK install, baseline sanity checks
+    ├── bin/
+    │   └── qemu-system-aarch64-patched  # patched QEMU binary (Git LFS, 32MB)
+    ├── qemu-launch.sh     # launch script for ARM64 guest on x86_64 host
+    ├── patches.md         # binary patch manifest (11 patches, full offsets + bytes)
+    ├── patch-props.sh     # post-boot: fake Pixel 4 identity on device
+    └── setup.sh           # WeChat APK install, baseline sanity checks
 ```
 
 The Python integration layer lives in [ablation](https://github.com/zellkernel/ablation) at `modules/wechat_re.py` — `probe_discover()`, `probe_hook()`, `probe_dump()`, `injector_build()`, `injector_push()`.
@@ -75,6 +80,33 @@ Transparent MMTLS record parser. Taps the WeChat TCP stream (via iptables REDIRE
 ### mmtls_crafter — record crafter
 
 Crafts MMTLS ClientHello / PSK binder records for replay and fuzzing. Uses HKDF-SHA384 for binder computation.
+
+## Emulator
+
+The Android SDK's `qemu-system-aarch64` (emulator 37.1.11.0) includes an arch guard that rejects ARM64 guests on x86_64 hosts. Calling the binary directly bypasses the wrapper — but the QEMU frontend was built for x86 guests, so every device it tries to create uses PCI bus (`virtio-XXX-pci`). The ARM ranchu machine type has no PCI bus — it uses VirtIO MMIO. Every PCI device is a fatal exit.
+
+11 binary patches applied directly to the stock Google binary — no recompile, no source:
+
+| Patch | Fix |
+|-------|-----|
+| P1–P3 | Suppress HDA audio PCI device (ranchu has no PCI bus) |
+| P4, P4b | `virtio-serial-pci` → `virtio-serial-device` (MMIO) |
+| P7 | Bypass 11-device `virtio_input_multi_touch_pci_{1..11}` loop |
+| P8–P9 | `virtio-wifi-pci` → `virtio-wifi-device` (string injection) |
+| P10–P11 | `virtio-vsock-pci` → `virtio-vsock` (string injection) |
+
+Technique: RIP-relative LEA displacement redirects into a 130k zero-padded rodata area at file offset `0x505600`. Strings too long to replace in-place are injected there and the LEA displacement rewritten to point at them. The kernel, ramdisk, and system images are all stock Google — only the QEMU frontend binary is modified.
+
+Full patch manifest (offsets, before/after bytes, effects): [`emulator/patches.md`](emulator/patches.md)
+Emulator README and launch instructions: [`emulator/README.md`](emulator/README.md)
+
+```sh
+# Launch Android 14 ARM64 (expect 15-30 min to full boot, no KVM)
+bash emulator/qemu-launch.sh
+
+# Check boot status
+adb -s emulator-5554 shell getprop sys.boot_completed
+```
 
 ## Build
 
