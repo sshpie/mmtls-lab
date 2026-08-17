@@ -224,8 +224,9 @@ uint64_t gicr_read(void *dev, uint64_t off, int size)
         switch (local_off) {
         case GICR_CTLR: return g->rd[cpu].ctlr;
         case GICR_TYPER:
-            /* TYPER: Processor_Number[23:8], Last bit if last RD */
-            return ((uint64_t)cpu << 8) |
+            /* Aff0 at bits[39:32], Processor_Number at bits[23:8], Last at bit[4] */
+            return ((uint64_t)cpu << 32) |
+                   ((uint64_t)cpu << 8)  |
                    (cpu == g->num_cpus-1 ? (1ULL << 4) : 0);
         case GICR_WAKER: return g->rd[cpu].waker;
         default: return 0;

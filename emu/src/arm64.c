@@ -203,8 +203,39 @@ static int cpu_load(ARM64CPU *c, PhysMem *mem, uint64_t va, int sz,
     uint64_t val = 0;
     if (mmu_on(c)) {
         int el = (c->pstate >> PSTATE_EL_SHIFT) & 3;
+        (void)el;
         if (!mmu_load(c, mem, va, sz, is_signed, &val, MEM_READ)) {
-            /* fault already injected by mmu_load */
+            /* Translation fault → Data Abort at EL1.
+             * Only inject exception if VBAR is set; before VBAR setup the kernel
+             * uses idmap and small-VA accesses are early boot anomalies that are
+             * handled gracefully with a 0 return. */
+            if (c->vbar_el1 != 0) {
+                static uint64_t dflt_count = 0;
+                dflt_count++;
+                if (dflt_count <= 50 || (dflt_count % 10000) == 0)
+                    fprintf(stderr, "[DATA-ABORT-LOAD#%llu] VA=0x%016llx PC=0x%016llx\n",
+                            (unsigned long long)dflt_count,
+                            (unsigned long long)va, (unsigned long long)c->pc);
+                /* Crash at task+0x968 deref: dump sp_el0 and its field */
+                if (dflt_count == 1 && c->pc == 0xffffffc0081c6d88ULL) {
+                    uint64_t task = c->sp_el0;
+                    uint64_t field_pa = 0;
+                    uint64_t field_val = 0;
+                    fprintf(stderr, "[CRASH-DIAG] sp_el0=0x%llx X8=0x%llx X19=0x%llx\n",
+                            (unsigned long long)task,
+                            (unsigned long long)c->x[8],
+                            (unsigned long long)c->x[19]);
+                    /* Read back field at task+0x968 via MMU */
+                    (void)field_pa; (void)field_val;
+                    /* Also dump X0-X5 for context */
+                    fprintf(stderr, "[CRASH-DIAG] X0=0x%llx X1=0x%llx X2=0x%llx X3=0x%llx X4=0x%llx X5=0x%llx LR=0x%llx\n",
+                            (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+                            (unsigned long long)c->x[2], (unsigned long long)c->x[3],
+                            (unsigned long long)c->x[4], (unsigned long long)c->x[5],
+                            (unsigned long long)c->x[30]);
+                }
+                cpu_take_exception(c, (0x25ULL << 26) | 0x04ULL, va, EL1);
+            }
             return -1;
         }
     } else {
@@ -226,7 +257,7 @@ static int cpu_load(ARM64CPU *c, PhysMem *mem, uint64_t va, int sz,
         }
     }
     *out = val;
-    return 0;
+    return 1;
 }
 
 static int cpu_store(ARM64CPU *c, PhysMem *mem, uint64_t va, int sz, uint64_t val)
@@ -242,18 +273,62 @@ static int cpu_store(ARM64CPU *c, PhysMem *mem, uint64_t va, int sz, uint64_t va
     }
 
     if (mmu_on(c)) {
-        if (!mmu_store(c, mem, va, sz, val)) return -1;
+        if (!mmu_store(c, mem, va, sz, val)) {
+            /* Translation fault → Data Abort at EL1 (store). Only after VBAR is set. */
+            if (c->vbar_el1 != 0) {
+                static uint64_t store_fault_count = 0;
+                store_fault_count++;
+                if (store_fault_count <= 50 || (store_fault_count % 10000) == 0)
+                    fprintf(stderr, "[DATA-ABORT-STORE#%llu] VA=0x%016llx PC=0x%016llx val=0x%llx\n",
+                            (unsigned long long)store_fault_count,
+                            (unsigned long long)va, (unsigned long long)c->pc,
+                            (unsigned long long)val);
+                cpu_take_exception(c, (0x25ULL << 26) | 0x44ULL, va, EL1);
+            }
+            return -1;
+        }
     } else {
         mem_write(mem, va, val, sz);
     }
-    return 0;
+    return 1;
 }
 
 static int cpu_fetch(ARM64CPU *c, PhysMem *mem, uint64_t va, uint32_t *out)
 {
     if (mmu_on(c)) {
         uint32_t v;
-        if (!mmu_read_u32(c, mem, va, &v)) return -1;
+        if (!mmu_read_u32(c, mem, va, &v)) {
+            /* Instruction fetch abort: EC=0x20 (InsnAbort lower EL) or 0x21 (InsnAbort same EL).
+             * We're at EL1 fetching kernel code → same EL → EC=0x21.
+             * IFSC=0x04 (translation fault level 0 — simplified; covers any page-not-present). */
+            static int fetch_abort_log = 0;
+            if (fetch_abort_log < 10) {
+                fprintf(stderr, "[FETCH-ABORT#%d] VA=0x%llx insn_count=%llu\n",
+                        ++fetch_abort_log, (unsigned long long)va,
+                        (unsigned long long)c->insn_count);
+                /* Manual L1 walk to pinpoint why translation failed */
+                if (fetch_abort_log <= 2) {
+                    uint64_t ttbr1 = c->ttbr1_el1 & ~0xFFFULL;
+                    uint64_t l1_idx = (va >> 30) & 0x1FF;
+                    uint64_t l1_pa  = ttbr1 + l1_idx * 8;
+                    uint64_t l1_val = mem_read(mem, l1_pa, 8);   /* PHYSICAL read */
+                    uint64_t l2_base = l1_val & ~0xFFFULL;
+                    uint64_t l2_idx  = (va >> 21) & 0x1FF;
+                    uint64_t l2_pa   = l2_base + l2_idx * 8;
+                    uint64_t l2_val  = (l1_val & 3) == 3 ? mem_read(mem, l2_pa, 8) : 0xDEAD;
+                    fprintf(stderr,
+                        "  TTBR1=0x%llx L1[%llu]@0x%llx=0x%016llx"
+                        "  L2[%llu]@0x%llx=0x%016llx\n",
+                        (unsigned long long)ttbr1,
+                        (unsigned long long)l1_idx, (unsigned long long)l1_pa,
+                        (unsigned long long)l1_val,
+                        (unsigned long long)l2_idx, (unsigned long long)l2_pa,
+                        (unsigned long long)l2_val);
+                }
+            }
+            cpu_take_exception(c, (0x21ULL << 26) | 0x04ULL, va, EL1);
+            return -1;
+        }
         *out = v;
     } else {
         *out = (uint32_t)mem_read(mem, va, 4);
@@ -267,10 +342,76 @@ static int cpu_fetch(ARM64CPU *c, PhysMem *mem, uint64_t va, uint32_t *out)
 
 void cpu_take_exception(ARM64CPU *c, uint64_t esr, uint64_t far, int target_el)
 {
-    fprintf(stderr, "[EXCEP] PC=0x%llx EC=0x%02x ESR=0x%08llx FAR=0x%016llx VBAR=0x%llx\n",
-            (unsigned long long)c->pc, (unsigned)(esr >> 26) & 0x3f,
-            (unsigned long long)esr, (unsigned long long)far,
-            (unsigned long long)c->vbar_el1);
+    static uint64_t exc_count = 0;
+    exc_count++;
+    /* Also log first 30 exceptions near stuck PACIASP address */
+    static int exc_near_spin = 0;
+    bool near_spin = (c->pc >= 0xffffffc0080b7f70ULL && c->pc <= 0xffffffc0080b7fa0ULL)
+                  && exc_near_spin < 30;
+    if (near_spin) exc_near_spin++;
+    if (exc_count <= 10 || (exc_count % 1000) == 0 || near_spin)
+        fprintf(stderr, "[EXCEP#%llu] PC=0x%llx EC=0x%02x ESR=0x%08llx FAR=0x%016llx VBAR=0x%llx ELR=0x%llx SP=%llu caller=%p\n",
+                (unsigned long long)exc_count,
+                (unsigned long long)c->pc, (unsigned)(esr >> 26) & 0x3f,
+                (unsigned long long)esr, (unsigned long long)far,
+                (unsigned long long)c->vbar_el1,
+                (unsigned long long)c->elr_el1,
+                (unsigned long long)c->sp_el1,
+                __builtin_return_address(0));
+    /* Detect recursive exception loop: if the previous ELR_EL1 already points inside
+     * the exception vector table (VBAR_EL1 .. VBAR_EL1+0x800), we are recursing.
+     * After 5 such recursive faults at the same FAR, halt so we can inspect state. */
+    if (c->vbar_el1 != 0 && c->elr_el1 != 0) {
+        uint64_t vbar = c->vbar_el1;
+        if (c->elr_el1 >= vbar && c->elr_el1 < vbar + 0x800) {
+            static uint64_t rec_count = 0;
+            static uint64_t rec_far   = 0;
+            if (rec_far != far) { rec_far = far; rec_count = 0; }
+            rec_count++;
+            fprintf(stderr, "[RECURSIVE-EXCEP#%llu] elr=0x%llx far=0x%llx ec=0x%02x — exception handler itself faulted!\n",
+                    (unsigned long long)rec_count,
+                    (unsigned long long)c->elr_el1,
+                    (unsigned long long)far,
+                    (unsigned)(esr >> 26) & 0x3f);
+            if (rec_count >= 5) {
+                fprintf(stderr, "[HALT] Recursive exception loop detected at FAR=0x%llx. Dumping regs and stopping.\n",
+                        (unsigned long long)far);
+                fprintf(stderr, "  VBAR=0x%llx ELR=0x%llx SPSR=0x%llx ESR=0x%llx FAR=0x%llx\n",
+                        (unsigned long long)c->vbar_el1, (unsigned long long)c->elr_el1,
+                        (unsigned long long)c->spsr_el1, (unsigned long long)c->esr_el1,
+                        (unsigned long long)c->far_el1);
+                fprintf(stderr, "  SP_EL1=0x%llx\n", (unsigned long long)c->sp_el1);
+                c->halted = true;
+                return;
+            }
+        }
+    }
+    /* Detect kernel null-ptr write spiral: EC=0x25 (data abort EL1), WnR=1,
+     * FAR in very low VA (< 4MB).  This is the kernel exception handler
+     * following a null pointer and writing to sequential low addresses, each
+     * faulting because TTBR0 doesn't cover VA=0.  After 50 such exceptions,
+     * halt — the kernel has panicked and the loop is unproductive. */
+    {
+        uint32_t ec_field = (esr >> 26) & 0x3f;
+        bool is_write_fault = (ec_field == 0x25) && (esr & (1u << 6));
+        if (is_write_fault && far < 0x400000ULL) {
+            static uint64_t low_write_count = 0;
+            if (++low_write_count == 1)
+                fprintf(stderr, "[LOW-WRITE-FAULT#1] PC=0x%llx FAR=0x%llx — kernel null-ptr spiral detected\n",
+                        (unsigned long long)c->pc, (unsigned long long)far);
+            if (low_write_count >= 50) {
+                fprintf(stderr, "[HALT] Kernel null-ptr write spiral: %llu write faults at VA<4MB. Last FAR=0x%llx PC=0x%llx\n",
+                        (unsigned long long)low_write_count,
+                        (unsigned long long)far, (unsigned long long)c->pc);
+                c->halted = true;
+                return;
+            }
+        }
+    }
+
+    /* Exceptions invalidate the exclusive monitor per ARM spec */
+    c->excl_valid = false;
+
     /* Save state to EL1 (we only support EL0/EL1) */
     c->spsr_el1 = c->pstate;
     c->elr_el1  = c->pc;
@@ -306,6 +447,8 @@ void cpu_take_exception(ARM64CPU *c, uint64_t esr, uint64_t far, int target_el)
     /* else sync: offset unchanged */
 
     c->pc = vec_base + offset;
+    c->exc_taken = true;
+    c->halted = false;  /* exception cancels WFI */
 }
 
 /* ============================================================
@@ -321,6 +464,12 @@ void cpu_irq_check(ARM64CPU *c, EmuMachine *m)
     int irq = gic_find_best_irq_for_cpu(&m->gic, c->id);
     if (irq < 0) return;
 
+    static uint64_t irq_exc_count = 0;
+    if (++irq_exc_count <= 10)
+        fprintf(stderr, "[IRQ-EXCEPTION#%llu] IRQ=%d PC=0x%llx pstate=0x%08x\n",
+                (unsigned long long)irq_exc_count, irq,
+                (unsigned long long)c->pc, c->pstate);
+
     /* ESR for IRQ = EC=0 (unknown), leave ISS=0 */
     cpu_take_exception(c, 0ULL, 0ULL, EL1);
 }
@@ -333,7 +482,7 @@ static uint64_t sysreg_read(ARM64CPU *c, EmuMachine *m, uint32_t key)
 {
     switch (key) {
     case SR_MIDR_EL1:      return 0x410FD034ULL;  /* Cortex-A53 */
-    case SR_MPIDR_EL1:     return 0x80000000ULL | c->id;
+    case SR_MPIDR_EL1:     return (uint64_t)c->id;  /* Aff0=cpu_id, U=0 (SMP) */
     case SR_CTR_EL0:       return 0x80030003ULL;
     case SR_SCTLR_EL1:     return c->sctlr_el1;
     case SR_CPACR_EL1:     return c->cpacr_el1;
@@ -353,8 +502,8 @@ static uint64_t sysreg_read(ARM64CPU *c, EmuMachine *m, uint32_t key)
     case SR_CNTKCTL_EL1:   return c->cntkctl_el1;
     case SR_CNTFRQ_EL0:    return m->timer.cntfrq;
     case SR_CNTPCT_EL0:    return machine_read_cntpct(m);
+    case SR_CNTVCT_EL0:    return machine_read_cntpct(m);  /* virtual = physical */
     case SR_CNTP_CTL_EL0: {
-        /* ISTATUS is read-only and derived: set when ENABLE=1 and CNTPCT >= CVAL */
         uint64_t ctl = c->cntp_ctl_el0 & 3;
         if ((ctl & 1) && machine_read_cntpct(m) >= c->cntp_cval_el0)
             ctl |= 4;
@@ -364,6 +513,17 @@ static uint64_t sysreg_read(ARM64CPU *c, EmuMachine *m, uint32_t key)
     case SR_CNTP_TVAL_EL0: {
         uint64_t cnt = machine_read_cntpct(m);
         return (uint32_t)(c->cntp_cval_el0 - cnt);
+    }
+    case SR_CNTV_CTL_EL0: {
+        uint64_t ctl = c->cntv_ctl_el0 & 3;
+        if ((ctl & 1) && machine_read_cntpct(m) >= c->cntv_cval_el0)
+            ctl |= 4;
+        return ctl;
+    }
+    case SR_CNTV_CVAL_EL0: return c->cntv_cval_el0;
+    case SR_CNTV_TVAL_EL0: {
+        uint64_t cnt = machine_read_cntpct(m);
+        return (uint32_t)(c->cntv_cval_el0 - cnt);
     }
     case SR_CURRENTEL:     return c->pstate & PSTATE_EL_MASK;
     case SR_DAIF:          return c->pstate & (PSTATE_D|PSTATE_A|PSTATE_I|PSTATE_F);
@@ -389,7 +549,7 @@ static uint64_t sysreg_read(ARM64CPU *c, EmuMachine *m, uint32_t key)
     case SR_PMCCNTR_EL0:   return m->total_insns;
     case SR_HCR_EL2:       return c->hcr_el2;
     case SR_VPIDR_EL2:     return 0x410FD034ULL;
-    case SR_VMPIDR_EL2:    return 0x80000000ULL | c->id;
+    case SR_VMPIDR_EL2:    return (uint64_t)c->id;
     case SR_CONTEXTIDR_EL1: return c->contextidr_el1;
     default:
         /* GIC system registers */
@@ -403,10 +563,133 @@ static void sysreg_write(ARM64CPU *c, EmuMachine *m, uint32_t key, uint64_t val)
     case SR_SCTLR_EL1:     c->sctlr_el1 = val; return;
     case SR_CPACR_EL1:     c->cpacr_el1 = val; return;
     case SR_TCR_EL1:       c->tcr_el1   = val; return;
-    case SR_TTBR0_EL1:     c->ttbr0_el1 = val; return;
-    case SR_TTBR1_EL1:     c->ttbr1_el1 = val; return;
+    case SR_TTBR0_EL1: {
+        static uint64_t ttbr0_count = 0; ttbr0_count++;
+        if (ttbr0_count <= 5 || c->ttbr0_el1 != val)
+            fprintf(stderr, "[MSR] TTBR0_EL1 <= 0x%016llx at PC=0x%016llx\n",
+                    (unsigned long long)val, (unsigned long long)c->pc);
+        c->ttbr0_el1 = val;
+        mmu_tlb_flush_all(c);
+        return;
+    }
+    case SR_TTBR1_EL1: {
+        uint64_t old_ttbr1 = c->ttbr1_el1;
+        static uint64_t ttbr1_count = 0; ttbr1_count++;
+        if (ttbr1_count <= 5 || old_ttbr1 != val)
+            fprintf(stderr, "[MSR] TTBR1_EL1 <= 0x%016llx at PC=0x%016llx\n",
+                    (unsigned long long)val, (unsigned long long)c->pc);
+        c->ttbr1_el1 = val;
+        /* Boot fixup for ranchu arm64 kernel:
+         * __create_page_tables only builds the idmap (TTBR0) and sets L1[257] of
+         * swapper_pg_dir (linear map).  It never writes L1[256] (the kernel text
+         * range 0xFFFFFFC000000000..0xFFFFFFC03FFFFFFF), so when __primary_switched
+         * switches TTBR1 to swapper and BRs to a kernel VA, the translation faults.
+         *
+         * Fix: when swapper's L1[256] is still 0 after the second TTBR1 write,
+         * synthesize a 4KB L2 table at a known-safe PA (0x4F000000, above kernel
+         * BSS/initrd) and wire it in.  KIMAGE_VADDR = 0xFFFFFFC008000000 lands at
+         * L2[64] within L1[256]; each entry maps a 2MB block.
+         *
+         * The L2 PA (0x4F000000) is above the 31MB kernel binary (~0x41F00000),
+         * above initrd (~0x481D0000), and below RAM end (0x60000000). The BSS
+         * clear in __primary_switched operates on kernel VAs (L1[256] mapping),
+         * and BSS ends well below the VA that maps 0x4F000000, so it survives. */
+        if (old_ttbr1 != 0 && val != 0 && old_ttbr1 != val) {
+            uint64_t old_base = old_ttbr1 & ~0xFFFULL;
+            uint64_t new_base = val       & ~0xFFFULL;
+            uint64_t old_l1_256 = mem_read(&m->mem, old_base + 256*8, 8);
+            uint64_t new_l1_256 = mem_read(&m->mem, new_base + 256*8, 8);
+            fprintf(stderr, "[TTBR1-SWITCH] old=0x%llx L1[256]=0x%llx  new=0x%llx L1[256]=0x%llx\n",
+                    (unsigned long long)old_base, (unsigned long long)old_l1_256,
+                    (unsigned long long)new_base, (unsigned long long)new_l1_256);
+            if (new_l1_256 == 0) {
+                if (old_l1_256 != 0) {
+                    /* Trampoline had it — just copy */
+                    mem_write(&m->mem, new_base + 256*8, old_l1_256, 8);
+                    fprintf(stderr, "[BOOT-FIXUP] Copied L1[256]=0x%llx from trampoline\n",
+                            (unsigned long long)old_l1_256);
+                } else {
+                    /* Neither table has L1[256]: synthesize kernel text mapping.
+                     * KIMAGE_VADDR=0xFFFFFFC008000000, PHYS_OFFSET=0x40000000.
+                     * VA offset in L1[256] window = 0x08000000 → L2[64].
+                     * PA formula: PA = 0x38000000 + L2_index * 2MB (derived from
+                     *   PA = VA - KIMAGE_VOFFSET where KIMAGE_VOFFSET=0xFFFFFFBFC8000000). */
+                    const uint64_t L2_PA    = 0x4F000000ULL; /* safe free PA */
+                    const uint64_t L2_START = 64;            /* L2 idx of KIMAGE_VADDR */
+                    const uint64_t L2_COUNT = 256;           /* 512MB / 2MB = enough */
+                    const uint64_t kram_base = 0x40000000ULL;
+                    const uint64_t kram_end  = 0x60000000ULL;
+                    /* TABLE descriptor: L1[256] → L2 table at L2_PA */
+                    mem_write(&m->mem, new_base + 256*8, L2_PA | 0x3ULL, 8);
+                    /* 2MB block descriptors: AP=0 (EL1 RW), SH=3, AF=1, valid, block */
+                    for (uint64_t i = L2_START; i < L2_START + L2_COUNT; i++) {
+                        uint64_t pa = 0x38000000ULL + i * 0x200000ULL;
+                        if (pa < kram_base || pa >= kram_end) continue;
+                        uint64_t entry = pa | 0x701ULL; /* block, AF, SH=3, AP=0 */
+                        mem_write(&m->mem, L2_PA + i * 8, entry, 8);
+                    }
+                    fprintf(stderr, "[BOOT-FIXUP] Synthesized kernel text L2 at 0x%llx"
+                            " L1[256]=0x%llx\n",
+                            (unsigned long long)L2_PA,
+                            (unsigned long long)(L2_PA | 0x3ULL));
+
+                    /* Synthesize linear map: L1[0] → L2_LM at 0x4F001000.
+                     * PAGE_OFFSET = 0xFFFFFF8000000000 (T1SZ=25), PHYS_OFFSET=0x40000000.
+                     * VA 0xFFFFFF8000000000 + i*2MB → PA 0x40000000 + i*2MB for i=0..255.
+                     * The kernel needs this to access its own data structures, page tables,
+                     * per-CPU areas, stack, kmalloc, etc. Without it, all linear-map
+                     * accesses (which is nearly everything) return 0 or fault. */
+                    const uint64_t LM_L2_PA  = 0x4F001000ULL; /* 4KB page just after ktext L2 */
+                    const uint64_t LM_BLOCKS = 256;            /* 256 × 2MB = 512MB of RAM */
+                    mem_write(&m->mem, new_base + 0*8, LM_L2_PA | 0x3ULL, 8); /* L1[0] = TABLE */
+                    for (uint64_t i = 0; i < LM_BLOCKS; i++) {
+                        uint64_t pa = kram_base + i * 0x200000ULL;
+                        uint64_t entry = pa | 0x701ULL;
+                        mem_write(&m->mem, LM_L2_PA + i * 8, entry, 8);
+                    }
+                    fprintf(stderr, "[BOOT-FIXUP] Synthesized linear map L2 at 0x%llx"
+                            " L1[0]=0x%llx (PA 0x%llx..0x%llx)\n",
+                            (unsigned long long)LM_L2_PA,
+                            (unsigned long long)(LM_L2_PA | 0x3ULL),
+                            (unsigned long long)kram_base,
+                            (unsigned long long)(kram_base + LM_BLOCKS*0x200000ULL - 1));
+                }
+            }
+            /* TCR_EL1 is 0 when booting at EL1: the only msr tcr_el1 in the binary
+             * (PA 0x410469fc) copies from tcr_el12 which is only accessible at EL2.
+             * Without a valid TCR, T1SZ=0 → VA_bits=64 → start_level=0, so the MMU
+             * walks L0 (not L1) and finds nothing → all kernel VA loads return 0.
+             * Force T1SZ=T0SZ=25 (39-bit VA), 4KB granule, IS, WB-WA, IPS=40-bit. */
+            if (c->tcr_el1 == 0) {
+                c->tcr_el1 = 0x00000002B5193519ULL;
+                fprintf(stderr, "[BOOT-FIXUP] Set TCR_EL1=0x%016llx"
+                        " (T1SZ=25 T0SZ=25 TG0=4K TG1=4K SH=IS IRGN/ORGN=WB IPS=40b)\n",
+                        (unsigned long long)c->tcr_el1);
+            }
+            /* Dump all non-zero L1 entries of the new swapper table */
+            fprintf(stderr, "[SWAPPER-L1-DUMP] base=0x%llx:\n", (unsigned long long)new_base);
+            for (int li = 0; li < 512; li++) {
+                uint64_t e = mem_read(&m->mem, new_base + (uint64_t)li * 8, 8);
+                if (e != 0)
+                    fprintf(stderr, "  L1[%d]=0x%016llx\n", li, (unsigned long long)e);
+            }
+        }
+        /* Only invalidate snapshots when the page table root actually changes.
+         * Linux ARM64 issues MSR TTBR1_EL1, Xn (same value) as an ASID-flush
+         * idiom around context switches; this must NOT reset the snapshot or
+         * the next fetch re-reads corrupted physical memory. */
+        if ((c->ttbr1_el1 & ~0xFFFFULL) != (old_ttbr1 & ~0xFFFFULL))
+            mmu_l1snap_invalidate(c);
+        else
+            mmu_tlb_flush_all(c);  /* same page table: flush TLB/PTC but keep snap */
+        return;
+    }
     case SR_MAIR_EL1:      c->mair_el1  = val; return;
-    case SR_VBAR_EL1:      c->vbar_el1  = val; return;
+    case SR_VBAR_EL1:
+        fprintf(stderr, "[MSR] VBAR_EL1 <= 0x%016llx at PC=0x%016llx\n",
+                (unsigned long long)val, (unsigned long long)c->pc);
+        c->vbar_el1 = val;
+        return;
     case SR_ELR_EL1:       c->elr_el1   = val; return;
     case SR_SPSR_EL1:      c->spsr_el1  = val; return;
     case SR_SP_EL0:        c->sp_el0    = val; return;
@@ -424,6 +707,15 @@ static void sysreg_write(ARM64CPU *c, EmuMachine *m, uint32_t key, uint64_t val)
     case SR_CNTP_TVAL_EL0: {
         uint64_t cnt = machine_read_cntpct(m);
         c->cntp_cval_el0 = cnt + (int32_t)(uint32_t)val;
+        return;
+    }
+    case SR_CNTV_CTL_EL0:
+        c->cntv_ctl_el0 = (c->cntv_ctl_el0 & ~3ULL) | (val & 3);
+        return;
+    case SR_CNTV_CVAL_EL0: c->cntv_cval_el0 = val; return;
+    case SR_CNTV_TVAL_EL0: {
+        uint64_t cnt = machine_read_cntpct(m);
+        c->cntv_cval_el0 = cnt + (int32_t)(uint32_t)val;
         return;
     }
     case SR_DAIF: {
@@ -456,6 +748,11 @@ static void sysreg_write(ARM64CPU *c, EmuMachine *m, uint32_t key, uint64_t val)
     case SR_VMPIDR_EL2:    c->vmpidr_el2 = val; return;
     case SR_CONTEXTIDR_EL1: c->contextidr_el1 = val; return;
     default:
+        /* TLBI instructions all have CRn=8; flush TLB on any such write */
+        if (((key >> 7) & 0xF) == 8) {
+            mmu_tlb_flush_all(c);
+            return;
+        }
         gic_sysreg_write(&m->gic, c->id, key, val);
         return;
     }
@@ -751,25 +1048,104 @@ static int exec_branch(ARM64CPU *c, EmuMachine *m, uint32_t insn)
         case 0: /* SVC */
             cpu_take_exception(c, (0x15ULL << 26) | imm16, c->pc, EL1);
             return 1;
-        case 1: /* HVC — treat as NOP in EL1 */
+        case 1: { /* HVC — PSCI dispatch */
+            uint64_t fn = c->x[0];
+            static uint64_t hvc_log = 0;
+            if (hvc_log < 16)
+                fprintf(stderr, "[HVC#%llu] PC=0x%llx fn=0x%llx X1=0x%llx X2=0x%llx X3=0x%llx\n",
+                        ++hvc_log, (unsigned long long)c->pc,
+                        (unsigned long long)fn,
+                        (unsigned long long)c->x[1],
+                        (unsigned long long)c->x[2],
+                        (unsigned long long)c->x[3]);
+            else hvc_log++;
+            switch (fn) {
+            case 0x84000000: /* PSCI_VERSION */
+                c->x[0] = 0x00020000;  /* version 2.0 */
+                break;
+            case 0x84000001: /* CPU_SUSPEND 32 */
+            case 0xC4000001: /* CPU_SUSPEND 64 */
+                c->x[0] = 0;  /* SUCCESS — shallow suspend, return immediately */
+                break;
+            case 0x84000002: /* CPU_OFF */
+                c->halted = true;
+                c->x[0] = 0;
+                break;
+            case 0x84000003: /* CPU_ON 32 */
+            case 0xC4000003: /* CPU_ON 64 */ {
+                uint64_t target_mpidr = c->x[1];
+                uint64_t entry_pa     = c->x[2];
+                uint64_t context_id   = c->x[3];
+                int target_aff0 = (int)(target_mpidr & 0xff);
+                ARM64CPU *tgt = NULL;
+                for (int ci = 0; ci < m->num_cpus; ci++) {
+                    if (m->cpu[ci].id == target_aff0) { tgt = &m->cpu[ci]; break; }
+                }
+                if (!tgt) { c->x[0] = (uint64_t)-2; break; }  /* INVALID_PARAMS */
+                if (!tgt->halted) { c->x[0] = (uint64_t)-4; break; }  /* ALREADY_ON */
+                /* Initialize secondary CPU state per PSCI spec */
+                memset(tgt->x, 0, sizeof(tgt->x));
+                tgt->x[0]      = context_id;
+                tgt->pc        = entry_pa;
+                tgt->pstate    = (EL1 << PSTATE_EL_SHIFT) | PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F | PSTATE_SP;
+                tgt->sctlr_el1 = 0x00C50078ULL;  /* MMU off */
+                tgt->sp_el0    = 0;
+                tgt->sp_el1    = 0;
+                tgt->halted    = false;
+                tgt->exc_taken = false;
+                fprintf(stderr, "[PSCI CPU_ON] cpu%d entry=0x%llx ctx=0x%llx\n",
+                        target_aff0, (unsigned long long)entry_pa, (unsigned long long)context_id);
+                c->x[0] = 0;  /* SUCCESS */
+                break;
+            }
+            case 0x84000004: /* AFFINITY_INFO 32 */
+            case 0xC4000004: /* AFFINITY_INFO 64 */
+                c->x[0] = 0;  /* ON */
+                break;
+            case 0x84000008: /* SYSTEM_OFF */
+                fprintf(stderr, "[PSCI SYSTEM_OFF]\n");
+                m->exit_request = true;
+                c->x[0] = 0;
+                break;
+            case 0x84000009: /* SYSTEM_RESET */
+                fprintf(stderr, "[PSCI SYSTEM_RESET]\n");
+                m->exit_request = true;
+                c->x[0] = 0;
+                break;
+            default:
+                /* KVM/pKVM host hypercalls (fn < 0x80000000) and unknown PSCI:
+                 * return success so kernel doesn't loop or take broken fallback path */
+                if (hvc_log <= 32)
+                    fprintf(stderr, "[HVC-UNK] fn=0x%llx -> returning 0\n",
+                            (unsigned long long)fn);
+                c->x[0] = 0;
+                break;
+            }
             return 0;
+        }
         case 2: /* SMC — treat as NOP */
             return 0;
         }
     }
 
-    /* BRK */
+    /* BRK — software breakpoint; vector to kernel's EL1 sync handler (VBAR+0x200).
+     * Do NOT set c->stopped: the kernel's own BUG/WARN handler runs in the handler. */
     if ((insn & 0xFFE0001F) == 0xD4200000) {
         uint32_t imm16 = (insn >> 5) & 0xFFFF;
-        /* Check software breakpoints */
-        c->stopped = true;
-        /* Raise software breakpoint exception */
+        static uint64_t brk_count = 0;
+        brk_count++;
+        if (brk_count <= 5 || (brk_count % 1000) == 0)
+            fprintf(stderr, "[BRK#%llu] PC=0x%llx imm=0x%x\n",
+                    (unsigned long long)brk_count, (unsigned long long)c->pc, imm16);
         cpu_take_exception(c, (0x3cULL << 26) | imm16, c->pc, EL1);
         return 1;
     }
 
     /* HLT */
     if ((insn & 0xFFE0001F) == 0xD4400000) {
+        uint32_t imm16 = (insn >> 5) & 0xFFFF;
+        fprintf(stderr, "[HLT] PC=0x%llx imm16=%u LR=0x%llx\n",
+                (unsigned long long)c->pc, imm16, (unsigned long long)c->x[30]);
         c->halted = true;
         return 1;
     }
@@ -783,19 +1159,33 @@ static int exec_branch(ARM64CPU *c, EmuMachine *m, uint32_t insn)
         switch (opc) {
         case 0: /* BR  */ c->pc = cpu_xreg(c, rn); break;
         case 1: /* BLR */ c->x[30] = c->pc + 4; c->pc = cpu_xreg(c, rn); break;
-        case 2: /* RET */ c->pc = cpu_xreg(c, rn ? rn : 30); break;
-        case 4: /* ERET */
-            fprintf(stderr, "[ERET] PC=0x%llx ELR_EL1=0x%llx SPSR_EL1=0x%08x SP_EL0=0x%llx SP_EL1=0x%llx\n",
-                    (unsigned long long)c->pc,
-                    (unsigned long long)c->elr_el1,
-                    c->spsr_el1,
-                    (unsigned long long)c->sp_el0,
-                    (unsigned long long)c->sp_el1);
+        case 2: /* RET */ {
+            uint64_t ret_target = cpu_xreg(c, rn ? rn : 30);
+            /* Log RET near the stuck PC range */
+            if (c->pc >= 0x410630c0ULL && c->pc <= 0x410635d0ULL) {
+                static int ret_log = 0;
+                if (ret_log < 8)
+                    fprintf(stderr, "[RET] PC=0x%llx X30=0x%llx (target)\n",
+                            (unsigned long long)c->pc,
+                            (unsigned long long)ret_target);
+                ret_log++;
+            }
+            c->pc = ret_target;
+            break;
+        }
+        case 4: /* ERET */ {
+            static uint64_t eret_count = 0;
+            eret_count++;
+            if (eret_count <= 5 || (eret_count % 100000) == 0)
+                fprintf(stderr, "[ERET#%llu] PC=0x%llx ELR=0x%llx SPSR=0x%08x\n",
+                        (unsigned long long)eret_count,
+                        (unsigned long long)c->pc,
+                        (unsigned long long)c->elr_el1,
+                        c->spsr_el1);
             c->pc     = c->elr_el1;
             c->pstate = c->spsr_el1;
-            fprintf(stderr, "[ERET] -> new pstate=0x%08x EL=%u SP_sel=%u\n",
-                    c->pstate, (c->pstate >> 2) & 3, c->pstate & 1);
             break;
+        }
         default: /* DRPS, unallocated — treat as NOP */ break;
         }
         return 1;
@@ -864,12 +1254,15 @@ static int exec_branch(ARM64CPU *c, EmuMachine *m, uint32_t insn)
     /* WFI */
     if (insn == 0xD503207F) {
         static uint64_t wfi_count = 0;
-        if ((++wfi_count & 0xFFFF) == 0)
-            fprintf(stderr, "[WFI] count=%llu PC=0x%llx pstate=0x%08x VBAR=0x%llx\n",
+        ++wfi_count;
+        if (wfi_count <= 4 || (wfi_count & 0xFFFF) == 0)
+            fprintf(stderr, "[WFI#%llu] PC=0x%llx LR=0x%llx pstate=0x%08x VBAR=0x%llx SCTLR=0x%llx\n",
                     (unsigned long long)wfi_count,
                     (unsigned long long)c->pc,
+                    (unsigned long long)c->x[30],
                     c->pstate,
-                    (unsigned long long)c->vbar_el1);
+                    (unsigned long long)c->vbar_el1,
+                    (unsigned long long)c->sctlr_el1);
         c->halted = true;
         return 1;
     }
@@ -877,7 +1270,7 @@ static int exec_branch(ARM64CPU *c, EmuMachine *m, uint32_t insn)
     if ((insn & 0xFFFFFFDF) == 0xD503205F) return 0;
 
     /* CLREX */
-    if (insn == 0xD503304F) return 0;
+    if (insn == 0xD503304F) { c->excl_valid = false; return 0; }
 
     return 0;
 }
@@ -889,6 +1282,50 @@ static int exec_branch(ARM64CPU *c, EmuMachine *m, uint32_t insn)
 static int exec_ldst(ARM64CPU *c, EmuMachine *m, uint32_t insn)
 {
     PhysMem *mem = &m->mem;
+    /* Load/Store Exclusive: bits[29:24] = 001000.
+     * Covers: LDXR, LDAXR, STXR, STLXR, LDXP, LDAXP, STXP, STLXP.
+     * All have (insn & 0x3F000000) == 0x08000000. */
+    if ((insn & 0x3F000000) == 0x08000000) {
+        bool     sf      = (insn >> 30) & 1;   /* 0=32-bit, 1=64-bit */
+        bool     is_pair = (insn >> 21) & 1;   /* LDXP/STXP */
+        bool     L       = (insn >> 22) & 1;   /* 1=Load, 0=Store */
+        uint32_t Rs      = (insn >> 16) & 0x1f;/* store-status dest */
+        uint32_t Rt2     = (insn >> 10) & 0x1f;/* pair second reg */
+        uint32_t Rn      = (insn >>  5) & 0x1f;/* base */
+        uint32_t Rt      = insn & 0x1f;         /* data register */
+        int sz           = sf ? 8 : 4;
+        uint64_t addr    = (Rn == 31) ? cpu_sp(c) : cpu_xreg(c, Rn);
+        PhysMem *mem     = &m->mem;
+        if (L) {
+            /* LDXR / LDAXR / LDXP / LDAXP */
+            uint64_t val = 0;
+            cpu_load(c, mem, addr, sz, false, sf, &val);
+            if (Rt != 31) cpu_set_xreg(c, Rt, sf ? val : (val & 0xFFFFFFFF));
+            if (is_pair) {
+                uint64_t val2 = 0;
+                cpu_load(c, mem, addr + sz, sz, false, sf, &val2);
+                if (Rt2 != 31) cpu_set_xreg(c, Rt2, sf ? val2 : (val2 & 0xFFFFFFFF));
+            }
+            c->excl_valid = true;
+            c->excl_addr  = addr;
+        } else {
+            /* STXR / STLXR / STXP / STLXP.
+             * Single-CPU: always succeed if reservation was set. */
+            bool ok = c->excl_valid;
+            if (ok) {
+                uint64_t val = (Rt == 31) ? 0 : (sf ? cpu_xreg(c, Rt) : cpu_xreg(c, Rt) & 0xFFFFFFFF);
+                cpu_store(c, mem, addr, sz, val);
+                if (is_pair) {
+                    uint64_t val2 = (Rt2 == 31) ? 0 : (sf ? cpu_xreg(c, Rt2) : cpu_xreg(c, Rt2) & 0xFFFFFFFF);
+                    cpu_store(c, mem, addr + sz, sz, val2);
+                }
+                c->excl_valid = false;
+            }
+            /* Rs = 0 on success, 1 on failure */
+            if (Rs != 31) cpu_set_xreg(c, Rs, ok ? 0 : 1);
+        }
+        return 0;
+    }
 
     /* LDR/STR literal (PC-relative) */
     if ((insn & 0x3B000000) == 0x18000000) {
@@ -928,8 +1365,7 @@ static int exec_ldst(ARM64CPU *c, EmuMachine *m, uint32_t insn)
         uint32_t idx_mode = (insn >> 23) & 3; /* 1=post, 2=offset, 3=pre */
 
         uint64_t base = (rn == 31) ? cpu_sp(c) : cpu_xreg(c, rn);
-        uint64_t addr = (idx_mode == 3) ? base + (uint64_t)imm7 : base;
-        if (idx_mode == 1) addr = base;
+        uint64_t addr = (idx_mode >= 2) ? base + (uint64_t)imm7 : base;
 
         if (is_simd) {
             /* FP/SIMD LDP/STP — simplified: treat as int */
@@ -980,10 +1416,10 @@ static int exec_ldst(ARM64CPU *c, EmuMachine *m, uint32_t insn)
     uint64_t addr = 0;
     uint32_t mode = (insn >> 24) & 3;
 
-    if ((insn & 0x1A000000) == 0x18000000) return 0;  /* already handled literal */
+    if ((insn & 0x3B000000) == 0x18000000) return 0;  /* already handled literal */
 
-    /* Register offset: bit[21] */
-    if (mode == 2 && ((insn >> 21) & 1)) {
+    /* Register offset: bit[21]=1 is the definitive discriminator */
+    if ((insn >> 21) & 1) {
         /* Register offset */
         uint32_t rm   = (insn >> 16) & 0x1f;
         uint32_t opt  = (insn >> 13) & 7;
@@ -1134,52 +1570,55 @@ static int exec_dp_reg(ARM64CPU *c, EmuMachine *m, uint32_t insn)
         return 0;
     }
 
-    /* Multiply — MADD/MSUB/SMULH/UMULH: bits[28:24]=11011 */
+    /* Multiply — MADD/MSUB/SMADDL/SMSUBL/UMADDL/UMSUBL/SMULH/UMULH: bits[28:24]=11011
+     * Bit layout: bit23=U (unsigned), bits[22:21]=op, bit15=o1 (subtract)
+     * op=00: MADD/MSUB (32 or 64-bit depending on sf)
+     * op=01: SMADDL/SMSUBL (U=0) or UMADDL/UMSUBL (U=1): 32-bit inputs, 64-bit result
+     * op=10: SMULH (U=0) or UMULH (U=1): high 64 bits of 64×64 product
+     * NOTE: Previous code used bits[24:23] for 'u' — wrong because bit24 is always 1
+     *       in this group (fixed 11011 at [28:24]), so UMADDL was misidentified as SMULH. */
     if ((insn & 0x1F000000) == 0x1B000000) {
         uint32_t rm   = (insn >> 16) & 0x1f;
         uint32_t ra   = (insn >> 10) & 0x1f;
         uint32_t rn   = (insn >>  5) & 0x1f;
         uint32_t rd   = insn & 0x1f;
         bool is_sub   = (insn >> 15) & 1;
-        uint32_t u    = (insn >> 23) & 3;  /* 00=MADD/MSUB 64, 01=SMADDL, 10=SMSUBL, 11=SMULH */
+        bool U        = (insn >> 23) & 1;     /* bit23: 1=unsigned */
+        uint32_t op   = (insn >> 21) & 3;     /* bits[22:21]: operation class */
 
-        uint64_t n = cpu_xreg(c, rn);
+        uint64_t n  = cpu_xreg(c, rn);
         uint64_t mm = cpu_xreg(c, rm);
-        uint64_t a = (ra == 31) ? 0 : cpu_xreg(c, ra);
+        uint64_t a  = (ra == 31) ? 0 : cpu_xreg(c, ra);
         uint64_t result;
 
-        switch (u) {
-        case 0:
+        switch (op) {
+        case 0: /* MADD / MSUB — 32-bit (sf=0) or 64-bit (sf=1) */
             if (!sf) {
-                result = (a & 0xFFFFFFFF) + (is_sub ? -((n & 0xFFFFFFFF) * (mm & 0xFFFFFFFF))
-                                                     :  ((n & 0xFFFFFFFF) * (mm & 0xFFFFFFFF)));
-                result &= 0xFFFFFFFF;
+                uint32_t prod32 = (uint32_t)n * (uint32_t)mm;
+                uint32_t acc32  = (uint32_t)(a & 0xFFFFFFFFULL);
+                result = (uint64_t)(uint32_t)(is_sub ? acc32 - prod32 : acc32 + prod32);
             } else {
                 result = a + (is_sub ? -(n * mm) : (n * mm));
             }
             break;
-        case 1: { /* SMADDL / SMSUBL: 32-bit signed × signed + 64-bit accumulate */
-            int64_t prod = (int64_t)(int32_t)n * (int64_t)(int32_t)mm;
-            result = (int64_t)a + (is_sub ? -prod : prod);
+        case 1: /* SMADDL/SMSUBL (U=0) or UMADDL/UMSUBL (U=1) */
+            if (U) {
+                uint64_t prod = (uint64_t)(uint32_t)n * (uint64_t)(uint32_t)mm;
+                result = a + (is_sub ? -prod : prod);
+            } else {
+                int64_t prod = (int64_t)(int32_t)n * (int64_t)(int32_t)mm;
+                result = (uint64_t)((int64_t)a + (is_sub ? -prod : prod));
+            }
             break;
-        }
-        case 2: { /* UMADDL */
-            uint64_t prod = (uint64_t)(uint32_t)n * (uint64_t)(uint32_t)mm;
-            result = a + (is_sub ? -prod : prod);
-            break;
-        }
-        case 3: {
-            if ((insn >> 22) & 1) {
-                /* UMULH */
+        case 2: /* SMULH (U=0) or UMULH (U=1) — high 64 bits, no accumulator */
+            if (U) {
                 __uint128_t prod = (__uint128_t)(uint64_t)n * (uint64_t)mm;
                 result = (uint64_t)(prod >> 64);
             } else {
-                /* SMULH */
                 __int128_t prod = (__int128_t)(int64_t)n * (int64_t)mm;
                 result = (uint64_t)((unsigned __int128)prod >> 64);
             }
             break;
-        }
         default: result = 0; break;
         }
         cpu_set_xreg(c, rd, result);
@@ -1424,8 +1863,108 @@ int cpu_step(ARM64CPU *c, EmuMachine *m)
         return -1;
     }
 
+    /* Log actual fetched instruction at stuck address */
+    if (c->pc == 0xffffffc0080b7f78ULL) {
+        static int fetch_logged = 0;
+        if (c->insn_count > 43000000 && fetch_logged < 5) {
+            fetch_logged++;
+            /* Also read linear-mapped PA for comparison */
+            uint64_t lin_pa = c->pc - 0xffffffbfc8000000ULL;
+            uint32_t lin_insn = (uint32_t)mem_read(&m->mem, lin_pa, 4);
+            fprintf(stderr, "[FETCH-SPIN#%d] insn_count=%llu fetched=0x%08x lin_pa=0x%llx lin_insn=0x%08x\n",
+                    fetch_logged, (unsigned long long)c->insn_count,
+                    insn, (unsigned long long)lin_pa, lin_insn);
+        }
+    }
+
+    /* Instruction trace for primary_entry region (first 32 insns) */
+    if (c->pc >= 0x41afac10ULL && c->pc <= 0x41afac90ULL) {
+        static int primary_trace = 0;
+        if (primary_trace < 64) {
+            uint32_t raw = (uint32_t)mem_read(&m->mem, c->pc, 4);
+            fprintf(stderr, "[PRIMARY] PC=0x%llx INSN=0x%08x X0=0x%llx X1=0x%llx X2=0x%llx\n",
+                    (unsigned long long)c->pc, raw,
+                    (unsigned long long)c->x[0],
+                    (unsigned long long)c->x[1],
+                    (unsigned long long)c->x[2]);
+            primary_trace++;
+        }
+    }
+
+    /* Instruction trace for __create_page_tables region */
+    if (c->pc >= 0x41afaca8ULL && c->pc <= 0x41afb000ULL) {
+        static int cpt_trace = 0;
+        if (cpt_trace < 128) {
+            uint32_t raw = (uint32_t)mem_read(&m->mem, c->pc, 4);
+            fprintf(stderr, "[CPT] PC=0x%llx INSN=0x%08x X0=0x%llx X3=0x%llx X6=0x%llx\n",
+                    (unsigned long long)c->pc, raw,
+                    (unsigned long long)c->x[0],
+                    (unsigned long long)c->x[3],
+                    (unsigned long long)c->x[6]);
+            cpt_trace++;
+        }
+    }
+
+    /* One-time dump before BR X8 (0x4106350c) that branches to kernel VA.
+     * Dump: TTBR1 base + swapper L1 table around the entry for ffffffc009afae64.
+     * T1SZ=25 → L1 walk: L1_idx = (va >> 30) & 0x1FF = 256 for our target VA.
+     * Also dump 4 entries either side of 256 to catch off-by-one alignment. */
+    if (c->pc == 0x4106350cULL) {
+        static int _once_br = 0;
+        if (!_once_br++) {
+            uint64_t ttbr1 = c->ttbr1_el1 & ~0xFFFULL;
+            uint64_t target_va = c->x[8]; /* X8 = ffffffc009afae64 */
+            int t1sz = (int)((c->tcr_el1 >> 16) & 0x3F);
+            int va_bits = 64 - t1sz;
+            int start_lvl = 3 - (va_bits - 1 - 12) / 9;
+            int shift0 = 39 - start_lvl * 9;
+            uint64_t l1_idx = (target_va >> shift0) & 0x1FF;
+            fprintf(stderr, "[SWAPPER-DUMP] BR X8=0x%llx TTBR1=0x%llx T1SZ=%d VA_BITS=%d start_level=%d shift=%d L1_idx=%llu\n",
+                    (unsigned long long)target_va,
+                    (unsigned long long)ttbr1, t1sz, va_bits, start_lvl, shift0,
+                    (unsigned long long)l1_idx);
+            /* Dump L1 entries [idx-4 .. idx+4] */
+            for (int di = -4; di <= 4; di++) {
+                uint64_t idx_i = l1_idx + (uint64_t)di;
+                uint64_t epa = ttbr1 + idx_i * 8;
+                uint64_t entry = mem_read(&m->mem, epa, 8);
+                fprintf(stderr, "[SWAPPER-L1] [%llu] PA=0x%llx entry=0x%016llx%s\n",
+                        (unsigned long long)idx_i,
+                        (unsigned long long)epa,
+                        (unsigned long long)entry,
+                        (idx_i == l1_idx) ? " <-- TARGET" : "");
+            }
+            /* If L1 entry is a TABLE, follow to L2 */
+            uint64_t l1_epa = ttbr1 + l1_idx * 8;
+            uint64_t l1_entry = mem_read(&m->mem, l1_epa, 8);
+            if (l1_entry & 1) { /* valid */
+                if (l1_entry & 2) { /* TABLE */
+                    uint64_t l2_base = l1_entry & ~0xFFFULL;
+                    int shift1 = shift0 - 9;
+                    uint64_t l2_idx = (target_va >> shift1) & 0x1FF;
+                    fprintf(stderr, "[SWAPPER-L2] Following TABLE to 0x%llx, L2_idx=%llu shift=%d\n",
+                            (unsigned long long)l2_base, (unsigned long long)l2_idx, shift1);
+                    for (int di = -2; di <= 2; di++) {
+                        uint64_t idx_i = l2_idx + (uint64_t)di;
+                        uint64_t epa = l2_base + idx_i * 8;
+                        uint64_t entry = mem_read(&m->mem, epa, 8);
+                        if (entry) fprintf(stderr, "[SWAPPER-L2] [%llu] PA=0x%llx entry=0x%016llx%s\n",
+                                (unsigned long long)idx_i, (unsigned long long)epa,
+                                (unsigned long long)entry,
+                                (idx_i == l2_idx) ? " <-- TARGET" : "");
+                    }
+                } else {
+                    fprintf(stderr, "[SWAPPER-L1] L1 is BLOCK entry (not TABLE)\n");
+                }
+            } else {
+                fprintf(stderr, "[SWAPPER-L1] L1 entry INVALID (not mapped)\n");
+            }
+        }
+    }
+
     uint64_t next_pc = c->pc + 4;
     int pc_updated = 0;
+    c->exc_taken = false;
 
     /* Decode via bits[28:25] */
     uint32_t group = (insn >> 25) & 0xF;
@@ -1470,7 +2009,7 @@ int cpu_step(ARM64CPU *c, EmuMachine *m)
         break;
     }
 
-    if (!pc_updated)
+    if (!pc_updated && !c->exc_taken)
         c->pc = next_pc;
 
     c->insn_count++;

@@ -6,6 +6,7 @@ set -euo pipefail
 SDK="$HOME/Android/Sdk"
 QEMU="$SDK/emulator/qemu/linux-x86_64/qemu-system-aarch64-patched"
 IMG_DIR="$SDK/system-images/android-34/google_apis/arm64-v8a"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VMDIR="$(cd "$(dirname "$0")/../vm" && pwd)"
 
 export LD_LIBRARY_PATH="$SDK/emulator/lib64:$SDK/emulator/lib64/qt/lib"
@@ -20,8 +21,7 @@ fi
 rm -f "$IMG_DIR"/*.qcow2 "$VMDIR"/*.qcow2 2>/dev/null || true
 
 echo "[+] Launching Android 14 ARM64 (ARM64 emulation — slow boot, ~5-10 min)"
-echo "    Once booted:  adb connect localhost:5554"
-echo "    Or:           adb -s emulator-5554 shell"
+echo "    ADB : adb connect localhost:5554"
 
 exec "$QEMU" \
     -sysdir "$IMG_DIR" \
@@ -30,7 +30,7 @@ exec "$QEMU" \
     -datadir "$VMDIR" \
     -data "$VMDIR/userdata.img" \
     -initdata "$IMG_DIR/userdata.img" \
-    -kernel "$IMG_DIR/kernel-ranchu" \
+    -kernel "$SCRIPT_DIR/bin/kernel-ranchu-patched.gz" \
     -ramdisk "$IMG_DIR/ramdisk.img" \
     -memory 4096 \
     -cores 4 \

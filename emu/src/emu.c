@@ -45,6 +45,7 @@ int main(int argc, char **argv)
     const char *cmdline  = NULL;
     const char *ctrl_sock = "/tmp/emu64-ctrl.sock";
     uint64_t    ram_mb   = 2048;
+    uint64_t    max_insns = 0;
 
     const char *disk_paths[MAX_VIRTIO_DEVS];
     bool        disk_ro[MAX_VIRTIO_DEVS];
@@ -61,6 +62,8 @@ int main(int argc, char **argv)
             ctrl_sock = argv[++i];
         } else if (!strcmp(argv[i], "-mem") && i+1 < argc) {
             ram_mb = strtoull(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "-max-insns") && i+1 < argc) {
+            max_insns = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "-disk") && i+1 < argc) {
             if (num_disks >= MAX_VIRTIO_DEVS) {
                 fprintf(stderr, "Too many disks (max %d)\n", MAX_VIRTIO_DEVS);
@@ -114,6 +117,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    g_machine.max_insns = max_insns;
     machine_run(&g_machine);
     return 0;
 }

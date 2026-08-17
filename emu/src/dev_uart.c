@@ -68,6 +68,13 @@ void uart_write(void *dev, uint64_t off, uint64_t val, int size)
     case UART_DR: {
         uint8_t c = val & 0xff;
         write(u->out_fd, &c, 1);
+        /* Debug: log first 200 chars so we can confirm UART is being hit */
+        static uint64_t uart_write_count = 0;
+        uart_write_count++;
+        if (uart_write_count <= 200)
+            fprintf(stderr, "[UART_DR#%llu] char=0x%02x '%c'\n",
+                    (unsigned long long)uart_write_count,
+                    (unsigned)c, (c >= 0x20 && c < 0x7f) ? (char)c : '.');
         break;
     }
     case UART_CR:    u->cr    = val; break;

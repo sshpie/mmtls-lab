@@ -75,6 +75,13 @@ void mem_write(PhysMem *m, uint64_t paddr, uint64_t val, int size) {
         return;
     /* RAM */
     if (paddr >= m->ram_base && paddr + size <= m->ram_base + m->ram_size) {
+        /* Watchpoint: init_task.cgroups at PA 0x41c5e428 */
+        if (paddr <= 0x41c5e428ULL && paddr + size > 0x41c5e428ULL) {
+            static int wp_count = 0;
+            if (++wp_count <= 4)
+                fprintf(stderr, "[WP-CGROUPS] write PA=0x%llx val=0x%llx size=%d\n",
+                        (unsigned long long)paddr, (unsigned long long)val, size);
+        }
         memcpy(m->ram + (paddr - m->ram_base), &val, size);
         return;
     }

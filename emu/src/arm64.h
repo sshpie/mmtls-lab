@@ -58,6 +58,10 @@
 #define SR_CNTP_CTL_EL0  SYSREG_KEY(3,3,14,2,1)
 #define SR_CNTP_CVAL_EL0 SYSREG_KEY(3,3,14,2,2)
 #define SR_CNTPCT_EL0    SYSREG_KEY(3,3,14,0,1)
+#define SR_CNTV_TVAL_EL0 SYSREG_KEY(3,3,14,3,0)
+#define SR_CNTV_CTL_EL0  SYSREG_KEY(3,3,14,3,1)
+#define SR_CNTV_CVAL_EL0 SYSREG_KEY(3,3,14,3,2)
+#define SR_CNTVCT_EL0    SYSREG_KEY(3,3,14,0,2)
 #define SR_ICC_SRE_EL1   SYSREG_KEY(3,0,12,12,5)
 #define SR_ICC_CTLR_EL1  SYSREG_KEY(3,0,12,12,4)
 #define SR_ICC_IGRPEN1_EL1 SYSREG_KEY(3,0,12,12,7)
@@ -125,9 +129,12 @@ typedef struct ARM64CPU {
     uint64_t  vpidr_el2;
     uint64_t  vmpidr_el2;
 
-    /* Timer */
+    /* Physical timer */
     uint64_t  cntp_cval_el0;
     uint32_t  cntp_ctl_el0;
+    /* Virtual timer */
+    uint64_t  cntv_cval_el0;
+    uint32_t  cntv_ctl_el0;
 
     /* Debug */
     uint64_t  mdscr_el1;
@@ -147,6 +154,13 @@ typedef struct ARM64CPU {
 
     /* Single-step flag */
     bool      single_step;
+
+    /* Set by cpu_take_exception so cpu_step knows not to overwrite PC with next_pc */
+    bool      exc_taken;
+
+    /* Exclusive monitor (for LDXR/STXR) */
+    bool      excl_valid;
+    uint64_t  excl_addr;
 
     /* Watchpoints: up to 16 */
     struct {

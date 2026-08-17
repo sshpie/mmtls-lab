@@ -55,3 +55,7 @@ bool mmu_load(struct ARM64CPU *cpu, PhysMem *mem, uint64_t va, int size,
               bool is_signed, uint64_t *out, MemAccess acc);
 bool mmu_store(struct ARM64CPU *cpu, PhysMem *mem, uint64_t va, int size,
                uint64_t val);
+
+/* TLB management */
+void mmu_tlb_flush_all(struct ARM64CPU *cpu);    /* TLBI: flush TLB+PTC, keep L1 snapshot */
+void mmu_l1snap_invalidate(struct ARM64CPU *cpu); /* TTBR1 write: also reset L1 snapshot */

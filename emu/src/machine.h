@@ -57,6 +57,7 @@ typedef struct EmuMachine {
 
     /* Statistics */
     uint64_t     total_insns;
+    uint64_t     max_insns;    /* 0 = unlimited */
 
     /* Config */
     uint64_t     ram_size;

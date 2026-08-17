@@ -38,26 +38,44 @@ uint64_t machine_read_cntpct(EmuMachine *m)
     return (elapsed_ns * m->timer.cntfrq) / 1000000000ULL;
 }
 
+/* GIC PPI INTID for each timer (PPI_n → INTID 16+n) */
+#define TIMER_PHYS_INTID  (14 + GIC_NUM_SGI)   /* CNTPNSIRQ: PPI 14 = INTID 30 */
+#define TIMER_VIRT_INTID  (11 + GIC_NUM_SGI)   /* CNTVIRQ:   PPI 11 = INTID 27 */
+
 void machine_timer_tick(EmuMachine *m)
 {
+    uint64_t cntpct = machine_read_cntpct(m);
     for (int c = 0; c < m->num_cpus; c++) {
         ARM64CPU *cpu = &m->cpu[c];
-        if (!(cpu->cntp_ctl_el0 & 1)) continue;       /* ENABLE=0 */
-        if (cpu->cntp_ctl_el0 & 2)  continue;         /* IMASK=1 */
-        uint64_t cntpct = machine_read_cntpct(m);
-        if (cntpct >= cpu->cntp_cval_el0) {
-            /* Timer fires: set ISTATUS, raise PPI 14 (physical timer) */
-            if (!(cpu->cntp_ctl_el0 & 4)) {
-                fprintf(stderr, "[TMR] CPU%d timer fired: cntpct=%llx cval=%llx isen0=%08x\n",
-                        c, (unsigned long long)cntpct,
-                        (unsigned long long)cpu->cntp_cval_el0,
-                        m->gic.rd[c].isen0);
+
+        /* Physical non-secure timer → INTID 30 */
+        if ((cpu->cntp_ctl_el0 & 1) && !(cpu->cntp_ctl_el0 & 2)) {
+            if (cntpct >= cpu->cntp_cval_el0) {
+                if (!(cpu->cntp_ctl_el0 & 4))
+                    fprintf(stderr, "[TMR-P] CPU%d phys fired cntpct=%llx cval=%llx\n",
+                            c, (unsigned long long)cntpct,
+                            (unsigned long long)cpu->cntp_cval_el0);
+                cpu->cntp_ctl_el0 |= 4;
+                gic_set_irq(&m->gic, TIMER_PHYS_INTID, true);
+            } else {
+                cpu->cntp_ctl_el0 &= ~4;
+                gic_set_irq(&m->gic, TIMER_PHYS_INTID, false);
             }
-            cpu->cntp_ctl_el0 |= 4;  /* ISTATUS */
-            gic_set_irq(&m->gic, 14 + GIC_NUM_SGI, true);
-        } else {
-            cpu->cntp_ctl_el0 &= ~4;
-            gic_set_irq(&m->gic, 14 + GIC_NUM_SGI, false);
+        }
+
+        /* Virtual timer → INTID 27 */
+        if ((cpu->cntv_ctl_el0 & 1) && !(cpu->cntv_ctl_el0 & 2)) {
+            if (cntpct >= cpu->cntv_cval_el0) {
+                if (!(cpu->cntv_ctl_el0 & 4))
+                    fprintf(stderr, "[TMR-V] CPU%d virt fired cntpct=%llx cval=%llx\n",
+                            c, (unsigned long long)cntpct,
+                            (unsigned long long)cpu->cntv_cval_el0);
+                cpu->cntv_ctl_el0 |= 4;
+                gic_set_irq(&m->gic, TIMER_VIRT_INTID, true);
+            } else {
+                cpu->cntv_ctl_el0 &= ~4;
+                gic_set_irq(&m->gic, TIMER_VIRT_INTID, false);
+            }
         }
     }
 }
@@ -206,7 +224,7 @@ int machine_init(EmuMachine *m, uint64_t ram_size,
         if (cmdline)
             snprintf(boot_args, sizeof(boot_args), "%s", cmdline);
         else
-            strcpy(boot_args, "console=ttyAMA0 earlycon kasan.mode=off");
+            strcpy(boot_args, "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 loglevel=8 kasan.mode=off");
 
         size_t dtb_size = dtb_generate(&m->mem, dtb_addr,
                                        boot_args, ram_size,
@@ -251,7 +269,7 @@ int machine_init(EmuMachine *m, uint64_t ram_size,
 
 /* --- Main run loop --- */
 
-#define INSNS_PER_CHECK 1000   /* check timers/ctrl every N instructions */
+#define INSNS_PER_CHECK 1024   /* check timers/ctrl every N instructions (must be power-of-2) */
 
 void machine_run(EmuMachine *m)
 {
@@ -260,14 +278,18 @@ void machine_run(EmuMachine *m)
 
     uint64_t loop_count = 0;
     uint64_t prev_pc[NUM_CPUS] = {0};
+    uint64_t last_status_milestone = 0;
+    uint64_t last_status_period    = 0; /* detect period change to reset milestone */
 
-    /* Instruction trace: dump every PC for the first 2000 insns */
+    /* Instruction trace: rolling ring buffer — always captures last ITRACE_MAX insns.
+     * Skip the __create_page_tables swapper-fill loop (0x41afac80-0x41afaca4) so
+     * the buffer isn't dominated by thousands of identical loop iterations. */
 #define ITRACE_MAX 2000
-    uint64_t itrace_pc[ITRACE_MAX] = {0};
+    uint64_t itrace_pc[ITRACE_MAX]   = {0};
     uint32_t itrace_insn[ITRACE_MAX] = {0};
-    uint64_t itrace_count = 0;
+    uint64_t itrace_count = 0;   /* total insns recorded (may exceed ITRACE_MAX) */
 
-    while (!m->exit_request) {
+    while (!m->exit_request && !(m->max_insns && m->total_insns >= m->max_insns)) {
         /* Execute one instruction per CPU */
         for (int c = 0; c < m->num_cpus; c++) {
             if (m->cpu[c].halted) {
@@ -280,36 +302,206 @@ void machine_run(EmuMachine *m)
                         m->cpu[c].halted = false;
                         m->cpu[c].pc += 4;  /* advance past WFI so ELR_EL1 returns after it */
                         cpu_irq_check(&m->cpu[c], m);
+                    } else {
+                        /* Periodically log why we can't wake */
+                        static uint64_t wfi_poll_cnt = 0;
+                        if ((++wfi_poll_cnt & 0x3FFFF) == 0) {  /* every ~256k loops */
+                            ARM64CPU *cpu0 = &m->cpu[0];
+                            uint64_t cntpct = machine_read_cntpct(m);
+                            fprintf(stderr,
+                                "[WFI-STALL] loop=%llu"
+                                " pctl=%x pcval=%llx"
+                                " vctl=%x vcval=%llx"
+                                " cntpct=%llx isen0=%08x ipend0=%08x igrpen1=%x\n",
+                                (unsigned long long)wfi_poll_cnt,
+                                cpu0->cntp_ctl_el0,
+                                (unsigned long long)cpu0->cntp_cval_el0,
+                                cpu0->cntv_ctl_el0,
+                                (unsigned long long)cpu0->cntv_cval_el0,
+                                (unsigned long long)cntpct,
+                                m->gic.rd[0].isen0,
+                                m->gic.rd[0].ipend0,
+                                m->gic.cpu[0].icc_igrpen1);
+                        }
                     }
                 }
             } else if (!m->cpu[c].stopped) {
                 prev_pc[c] = m->cpu[c].pc;
-                /* Record trace before stepping */
-                if (c == 0 && itrace_count < ITRACE_MAX) {
-                    itrace_pc[itrace_count] = m->cpu[c].pc;
-                    itrace_insn[itrace_count] =
-                        (uint32_t)mem_read(&m->mem, m->cpu[c].pc, 4);
-                    itrace_count++;
+                /* Record trace (ring buffer — skip tight loop to save slots) */
+                if (c == 0) {
+                    uint64_t tpc = m->cpu[c].pc;
+                    int in_loop = (tpc >= 0x41afac80ULL && tpc <= 0x41afaca4ULL)
+                              || (tpc >= 0x40ffcf2cULL && tpc <= 0x40ffcf38ULL)  /* DC ZVA BSS-clear */
+                              || (tpc >= 0x41063484ULL && tpc <= 0x410634a0ULL);  /* self-relocation loop */
+                    if (!in_loop) {
+                        uint64_t slot = itrace_count % ITRACE_MAX;
+                        itrace_pc[slot]   = tpc;
+                        /* Read instruction bytes: pre-MMU physical, or post-MMU via KIMAGE_VOFFSET */
+                        uint32_t insn_bytes;
+                        if (tpc >= VIRT_RAM_BASE && tpc < VIRT_RAM_BASE + m->mem.ram_size) {
+                            insn_bytes = (uint32_t)mem_read(&m->mem, tpc, 4);
+                        } else if ((int64_t)tpc < 0) {
+                            uint64_t pa = tpc - 0xffffffbfc8000000ULL;
+                            if (pa >= VIRT_RAM_BASE && pa < VIRT_RAM_BASE + m->mem.ram_size)
+                                insn_bytes = (uint32_t)mem_read(&m->mem, pa, 4);
+                            else
+                                insn_bytes = 0xDEAD0000;
+                        } else {
+                            insn_bytes = 0xDEADC0DE;
+                        }
+                        itrace_insn[slot] = insn_bytes;
+                        itrace_count++;
+                    }
+                }
+                /* One-shot trap: log caller when cpuset print function is entered */
+                if (c == 0 && m->cpu[c].pc == 0xffffffc0081c6d60ULL) {
+                    static int cpuset_trap = 0;
+                    cpuset_trap++;
+                    if (cpuset_trap <= 4) {
+                        ARM64CPU *cx = &m->cpu[0];
+                        fprintf(stderr,
+                            "[CPUSET-ENTER#%d] insns=%llu LR=0x%llx X18=0x%llx SP=0x%llx\n",
+                            cpuset_trap, (unsigned long long)m->total_insns,
+                            (unsigned long long)cx->x[30],
+                            (unsigned long long)cx->x[18],
+                            (unsigned long long)cx->sp_el1);
+                        /* Dump stack to find outer caller's LR */
+                        uint64_t sp = cx->sp_el1;
+                        for (int si = 0; si < 8; si++) {
+                            uint64_t v = 0;
+                            if (sp + si*8 >= 0xffffffc009000000ULL)
+                                v = mem_read(&m->mem, sp + si*8 - 0xffffffbfc8000000ULL, 8);
+                            if (v != 0 && (v >> 32) == 0xffffffc0)
+                                fprintf(stderr, "  [SP+%d]=0x%llx\n", si*8, (unsigned long long)v);
+                        }
+                    }
+                }
+                /* One-shot trace: first time we enter the spin function */
+                if (c == 0 && m->cpu[c].pc == 0xffffffc0080b7f78ULL) {
+                    static uint64_t spin_hits = 0;
+                    spin_hits++;
+                    if (spin_hits == 1 || spin_hits == 10 || spin_hits == 100 ||
+                        spin_hits == 1000 || (spin_hits % 1000000) == 0)
+                        fprintf(stderr, "[SPIN-HIT#%llu] insns=%llu\n",
+                                (unsigned long long)spin_hits,
+                                (unsigned long long)m->total_insns);
+                    static int spin_trace_done = 0;
+                    if (!spin_trace_done++) {
+                        ARM64CPU *cx = &m->cpu[0];
+                        fprintf(stderr, "[SPIN-ENTRY] insns=%llu PC=0x%llx LR=0x%llx pstate=0x%08x SP=0x%llx\n",
+                                (unsigned long long)m->total_insns,
+                                (unsigned long long)cx->pc,
+                                (unsigned long long)cx->x[30],
+                                cx->pstate,
+                                (unsigned long long)cx->sp_el1);
+                        /* Real MMU walk: VA -> PA for the stuck PC */
+                        {
+                            uint64_t va   = cx->pc;
+                            uint64_t ttbr = cx->ttbr1_el1 & ~0xFFFULL;
+                            int t1sz  = (int)((cx->tcr_el1 >> 16) & 0x3F);
+                            int va_bits = 64 - t1sz;
+                            int start_lvl = 3 - (va_bits - 1 - 12) / 9;
+                            fprintf(stderr, "[MMU-WALK] VA=0x%llx TTBR1=0x%llx T1SZ=%d VA_BITS=%d\n",
+                                    (unsigned long long)va, (unsigned long long)ttbr, t1sz, va_bits);
+                            for (int lv = start_lvl; lv <= 3; lv++) {
+                                int shift = 39 - (lv - start_lvl) * 9 - (9 * start_lvl);
+                                /* correct shift: highest level shift = 39 - 9*(lv) for 4K/L0 scheme */
+                                shift = (start_lvl == 1) ? (30 - (lv-1)*9) : (39 - lv*9);
+                                uint64_t idx = (va >> shift) & 0x1FF;
+                                uint64_t epa = ttbr + idx * 8;
+                                uint64_t entry = mem_read(&m->mem, epa, 8);
+                                const char *type = !(entry&1) ? "INVALID" : ((lv<3&&(entry&2)) ? "TABLE" : "BLOCK/PAGE");
+                                fprintf(stderr, "[MMU-WALK] L%d idx=%llu PA=0x%llx entry=0x%016llx [%s]\n",
+                                        lv, (unsigned long long)idx, (unsigned long long)epa,
+                                        (unsigned long long)entry, type);
+                                if (!(entry & 1)) break;
+                                if (lv < 3 && (entry & 2)) {
+                                    ttbr = entry & 0x0000FFFFFFFFF000ULL;
+                                } else {
+                                    uint64_t mask = (1ULL << shift) - 1;
+                                    uint64_t pa = (entry & 0x0000FFFFFFFFF000ULL) | (va & mask);
+                                    uint32_t insn = (uint32_t)mem_read(&m->mem, pa, 4);
+                                    fprintf(stderr, "[MMU-WALK] PA=0x%llx insn=0x%08x\n",
+                                            (unsigned long long)pa, insn);
+                                    /* Also dump PA+/-8 context */
+                                    for (int d = -2; d <= 4; d++) {
+                                        uint32_t w = (uint32_t)mem_read(&m->mem, pa + d*4, 4);
+                                        fprintf(stderr, "[MMU-WALK] [PA%+d]=0x%08x\n", d*4, w);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 cpu_step(&m->cpu[c], m);
                 m->total_insns++;
 
-                /* Trap: PC left valid RAM — halt and dump */
+                /* LEB128 scanner trace: log first visit and exit from 0x81ae818 region.
+                 * This is the ORC/kallsyms table parser — it runs N iterations per
+                 * kernel symbol/function and terminates naturally. Do NOT kick it. */
+                if (c == 0) {
+                    static uint64_t leb_entry_count = 0;
+                    static uint64_t leb_last_insns  = 0;
+                    bool at_leb = (m->cpu[c].pc == 0xffffffc0081ae818ULL);
+                    if (at_leb) {
+                        leb_entry_count++;
+                        if (leb_entry_count == 1 || leb_entry_count == 1000000) {
+                            ARM64CPU *cx = &m->cpu[0];
+                            fprintf(stderr,
+                                "[LEB128#%llu] insns=%llu X9=0x%llx X10=0x%llx\n",
+                                (unsigned long long)leb_entry_count,
+                                (unsigned long long)m->total_insns,
+                                (unsigned long long)cx->x[9],
+                                (unsigned long long)cx->x[10]);
+                        }
+                        leb_last_insns = m->total_insns;
+                    } else if (leb_entry_count > 0 && leb_last_insns > 0 &&
+                               m->total_insns == leb_last_insns + 1) {
+                        /* First instruction AFTER leaving 0x81ae818 */
+                        fprintf(stderr,
+                            "[LEB128-DONE] exited after %llu entries, insns=%llu PC=0x%llx\n",
+                            (unsigned long long)leb_entry_count,
+                            (unsigned long long)m->total_insns,
+                            (unsigned long long)m->cpu[c].pc);
+                        leb_last_insns = 0;  /* don't re-log */
+                    }
+                }
+                /* Progress heartbeat every 100M instructions */
+                if (c == 0 && (m->total_insns % 100000000ULL) == 0 && m->total_insns > 0) {
+                    fprintf(stderr, "[PROGRESS] %llu M insns PC=0x%llx\n",
+                        (unsigned long long)(m->total_insns / 1000000ULL),
+                        (unsigned long long)m->cpu[c].pc);
+                }
+
+                /* Trap: PC left valid RAM — halt and dump.
+                 * Only enforce physical range when MMU is off.  Once the MMU is on,
+                 * kernel VAs (bit63=1) are valid — they translate through TTBR1.
+                 * Physical range check still catches genuine PC=0 / runaway jumps to
+                 * unmapped physical space while MMU is off. */
                 uint64_t pc = m->cpu[c].pc;
-                if (pc < VIRT_RAM_BASE || pc >= VIRT_RAM_BASE + m->ram_size) {
+                bool mmu_active = !!(m->cpu[c].sctlr_el1 & (1ULL << 0)); /* SCTLR_EL1.M */
+                bool kernel_va  = (int64_t)pc < 0;                         /* bit63=1 */
+                bool pc_ok_phys = (pc >= VIRT_RAM_BASE && pc < VIRT_RAM_BASE + m->ram_size);
+                if (!(pc_ok_phys || (mmu_active && kernel_va))) {
                     fprintf(stderr,
                         "\n[!] CPU%d PC LEFT RAM after %llu insns\n"
                         "    prev_pc=0x%016llx  new_pc=0x%016llx\n",
                         c, (unsigned long long)m->total_insns,
                         (unsigned long long)prev_pc[c],
                         (unsigned long long)pc);
-                    /* Dump instruction trace */
-                    fprintf(stderr, "\nINSTRUCTION TRACE (first %llu):\n",
-                            itrace_count);
-                    for (uint64_t t = 0; t < itrace_count; t++)
-                        fprintf(stderr, "  [%3llu] 0x%016llx: 0x%08x\n",
-                                t, (unsigned long long)itrace_pc[t],
-                                itrace_insn[t]);
+                    /* Dump instruction trace (ring buffer, chronological order) */
+                    uint64_t n_rec = (itrace_count < ITRACE_MAX) ? itrace_count : ITRACE_MAX;
+                    uint64_t oldest = (itrace_count <= ITRACE_MAX) ? 0 : (itrace_count % ITRACE_MAX);
+                    fprintf(stderr, "\nINSTRUCTION TRACE (last %llu, total recorded %llu):\n",
+                            n_rec, itrace_count);
+                    for (uint64_t i = 0; i < n_rec; i++) {
+                        uint64_t slot = (oldest + i) % ITRACE_MAX;
+                        fprintf(stderr, "  [%4llu] 0x%016llx: 0x%08x\n",
+                                itrace_count - n_rec + i,
+                                (unsigned long long)itrace_pc[slot],
+                                itrace_insn[slot]);
+                    }
                     machine_dump_cpu(m, c);
                     m->cpu[c].stopped = true;
                     m->exit_request   = true;
@@ -327,28 +519,45 @@ void machine_run(EmuMachine *m)
             }
             machine_timer_tick(m);
 
-            /* Boot-phase status every 5M instructions */
-            if (m->total_insns > 0 && (m->total_insns % 5000000) == 0) {
-                ARM64CPU *c0 = &m->cpu[0];
-                fprintf(stderr, "[STATUS] insns=%llu PC=0x%llx EL=%u pstate=0x%08x SP_EL0=0x%llx SP_EL1=0x%llx TTBR0=0x%llx TTBR1=0x%llx VBAR=0x%llx SCTLR=0x%llx\n",
-                        (unsigned long long)m->total_insns,
-                        (unsigned long long)c0->pc,
-                        (c0->pstate >> 2) & 3,
-                        c0->pstate,
-                        (unsigned long long)c0->sp_el0,
-                        (unsigned long long)c0->sp_el1,
-                        (unsigned long long)c0->ttbr0_el1,
-                        (unsigned long long)c0->ttbr1_el1,
-                        (unsigned long long)c0->vbar_el1,
-                        (unsigned long long)c0->sctlr_el1);
-                /* Print first ITRACE on first status */
-                if (m->total_insns == 5000000 && itrace_count > 0) {
-                    fprintf(stderr, "\nBOOT TRACE (first %llu insns):\n", itrace_count);
-                    for (uint64_t t = 0; t < itrace_count; t++)
-                        fprintf(stderr, "  [%4llu] 0x%016llx: 0x%08x\n",
-                                t, (unsigned long long)itrace_pc[t],
-                                itrace_insn[t]);
-                    fprintf(stderr, "\n");
+            /* Boot-phase status every 100k instructions (first 1M) then every 1M */
+            {
+                uint64_t period = (m->total_insns < 1000000) ? 100000 : 1000000;
+                if (period != last_status_period) {
+                    last_status_period    = period;
+                    last_status_milestone = 0;  /* reset on period change */
+                }
+                uint64_t cur_ms = m->total_insns / period;
+                if (cur_ms > last_status_milestone) {
+                    last_status_milestone = cur_ms;
+                    ARM64CPU *c0 = &m->cpu[0];
+                    /* Read init_task.cgroups VA=0xffffffc009c5e428 PA=0x41c5e428 */
+                    uint64_t it_cgroups = mem_read(&m->mem, 0x41c5e428ULL, 8);
+                    fprintf(stderr, "[STATUS] insns=%llu PC=0x%llx LR=0x%llx X18=0x%llx EL=%u pstate=0x%08x SP=0x%llx TTBR1=0x%llx VBAR=0x%llx it_cgroups=0x%llx\n",
+                            (unsigned long long)m->total_insns,
+                            (unsigned long long)c0->pc,
+                            (unsigned long long)c0->x[30],
+                            (unsigned long long)c0->x[18],
+                            (c0->pstate >> 2) & 3,
+                            c0->pstate,
+                            (unsigned long long)c0->sp_el1,
+                            (unsigned long long)c0->ttbr1_el1,
+                            (unsigned long long)c0->vbar_el1,
+                            (unsigned long long)it_cgroups);
+                    /* Dump trace at first milestone and every 10th thereafter */
+                    if ((cur_ms == 1 || cur_ms % 10 == 0) && itrace_count > 0) {
+                        uint64_t nr = (itrace_count < ITRACE_MAX) ? itrace_count : ITRACE_MAX;
+                        uint64_t ol = (itrace_count <= ITRACE_MAX) ? 0 : (itrace_count % ITRACE_MAX);
+                        const char *label = (cur_ms == 1) ? "BOOT" : "FREEZE";
+                        fprintf(stderr, "\n%s TRACE (last %llu of %llu recorded):\n", label, nr, itrace_count);
+                        for (uint64_t i = 0; i < nr; i++) {
+                            uint64_t slot = (ol + i) % ITRACE_MAX;
+                            fprintf(stderr, "  [%4llu] 0x%016llx: 0x%08x\n",
+                                    itrace_count - nr + i,
+                                    (unsigned long long)itrace_pc[slot],
+                                    itrace_insn[slot]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
         }

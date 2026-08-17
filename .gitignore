@@ -3,3 +3,13 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# compiled binaries and profiling artifacts
+emu/emu64
+emu/emu64-prof
+emu/gmon.out
+
+# VM disk images and runtime state
+vm/
+emulator/vendor-custom.img
+emulator/bin/*.img

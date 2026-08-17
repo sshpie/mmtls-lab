@@ -67,13 +67,27 @@ ELF segment mapping:
 - Before: `48 8d 35 52 93 45 ff` (lea rsi,[0x481214] = "virtio-vsock-pci,guest-cid=77")
 - After:  `48 8d 35 7e d7 4d ff` (lea rsi,[0x505640] = "virtio-vsock,guest-cid=77")
 
+### P12 — virtio-blk-pci → virtio-blk-device (in-place string patch)
+- File offset: 0x47797C
+- Before: b"virtio-blk-pci\0Bit" (15-byte string + 3 bytes of "Bitmap" error msg)
+- After:  b"virtio-blk-device\0" (18 bytes, overwrites first 3 chars of "Bitmap")
+- Effect: QEMU creates block devices on virtio-mmio bus instead of PCI
+- TypeInfo structs at VA 0x1E49260 and 0x1E4A8A0 (RELATIVE relocs) point here
+- Root cause of Android init SIGSEGV: disk never enumerated without this patch
+
+### P13 — virtio-rng-pci → virtio-rng-device (in-place string patch)
+- File offset: 0x39A1DE
+- Before: b"virtio-rng-pci\0vir" (15-byte string + 3 bytes of "virtio_rng_pci_class_init")
+- After:  b"virtio-rng-device\0" (18 bytes)
+- Effect: RNG device on virtio-mmio bus (needed for kernel entropy at boot)
+- TypeInfo structs at VA 0x1E48A00 and 0x1E4A9C0
+
 ## Remaining known PCI devices (may need patching if hit)
 
-From string scan — present in binary but not yet hit as errors:
+From string scan — present in binary but not yet patched:
 - `virtio-tablet-pci`, `virtio-keyboard-pci`, `virtio-mouse-pci`, `virtio-dual-mode-mouse-pci`
   - In function at VA 0x11E7xxx; only hit if those input features are enabled
 - `virtio-gpu-pci` — likely skipped by `-gpu off`
-- `virtio-rng-pci`, `virtio-blk-pci` — may be needed; MMIO forms: virtio-rng-device, virtio-blk-device
 - `virtio-9p-pci` — host filesystem sharing, optional
 
 ## String injection area
