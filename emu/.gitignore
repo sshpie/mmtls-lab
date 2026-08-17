@@ -1,0 +1,4 @@
+*.o
+emu64
+build/
+test/
