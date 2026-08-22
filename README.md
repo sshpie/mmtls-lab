@@ -30,7 +30,7 @@ mmtls-lab/
     └── setup.sh           # WeChat APK install, baseline sanity checks
 ```
 
-The Python integration layer lives in [ablation](https://github.com/zellkernel/ablation) at `modules/wechat_re.py` — `probe_discover()`, `probe_hook()`, `probe_dump()`, `injector_build()`, `injector_push()`.
+The Python integration layer lives in [ablation](https://github.com/sshpie/ablation) at `modules/wechat_re.py` — `probe_discover()`, `probe_hook()`, `probe_dump()`, `injector_build()`, `injector_push()`.
 
 ## Protocol
 
